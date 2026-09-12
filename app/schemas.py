@@ -8,33 +8,28 @@ from pydantic import BaseModel, Field, HttpUrl, field_validator, model_validator
 
 
 # ---------------------------------------------------------------------------
-# Enums
+# Enums compartilhados
 # ---------------------------------------------------------------------------
 
 class BaselineAlign(str, Enum):
-    """Alinhamento vertical do símbolo inline em relação à linha de texto."""
-    center = "center"      # centralizado na altura total da linha
-    top = "top"            # alinhado ao topo da linha
-    baseline = "baseline"  # alinhado à base tipográfica
-
+    center   = "center"
+    top      = "top"
+    baseline = "baseline"
 
 class FitMode(str, Enum):
-    """Modo de redimensionamento para camadas de imagem."""
-    cover = "cover"      # preenche o espaço, cortando o excesso
-    contain = "contain"  # cabe inteiro sem cortar, mantendo proporção
-    none = "none"        # usa o tamanho original da imagem
-
+    cover   = "cover"
+    contain = "contain"
+    none    = "none"
 
 class TextAlign(str, Enum):
-    left = "left"
+    left   = "left"
     center = "center"
-    right = "right"
-
+    right  = "right"
 
 class TaskStatus(str, Enum):
     processing = "processing"
-    completed = "completed"
-    failed = "failed"
+    completed  = "completed"
+    failed     = "failed"
 
 
 # ---------------------------------------------------------------------------
@@ -42,18 +37,84 @@ class TaskStatus(str, Enum):
 # ---------------------------------------------------------------------------
 
 class CanvasSchema(BaseModel):
-    width: int = Field(default=1992, gt=0, le=8000)
-    height: int = Field(default=2770, gt=0, le=8000)
+    width:            int = Field(default=1992, gt=0, le=8000)
+    height:           int = Field(default=2770, gt=0, le=8000)
     background_color: str = Field(default="#FFFFFF", pattern=r"^#[0-9A-Fa-f]{6}$")
 
+
+# ---------------------------------------------------------------------------
+# SVG Transform
+# ---------------------------------------------------------------------------
+
+class FillSolid(BaseModel):
+    type:  Literal["solid"]
+    color: str = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
+
+
+class FillGradient(BaseModel):
+    type:      Literal["gradient"]
+    direction: Literal["horizontal", "vertical"]
+    colors:    list[str] = Field(min_length=2, max_length=10)
+
+    @field_validator("colors")
+    @classmethod
+    def validate_colors(cls, v: list[str]) -> list[str]:
+        pattern = re.compile(r"^#[0-9A-Fa-f]{6}$")
+        for c in v:
+            if not pattern.match(c):
+                raise ValueError(f"Cor de gradiente invalida: '{c}'. Use #RRGGBB.")
+        return v
+
+
+AnyFill = Annotated[
+    Union[FillSolid, FillGradient],
+    Field(discriminator="type"),
+]
+
+
+class Shadow(BaseModel):
+    color:       str   = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
+    blur_radius: int   = Field(default=4,   ge=0,    le=100)
+    offset_x:   int   = Field(default=2,   ge=-500, le=500)
+    offset_y:   int   = Field(default=2,   ge=-500, le=500)
+    opacity:    float = Field(default=1.0, ge=0.0,  le=1.0,
+                              description="Intensidade da sombra. 1.0 = opaco, 0.0 = invisível.")
+
+
+class SvgTransform(BaseModel):
+    fill:   Optional[AnyFill] = None  # None = mantém cores originais do SVG
+    shadow: Optional[Shadow] = None
+
+
+    @model_validator(mode="after")
+    def validate_at_least_one(self) -> "SvgTransform":
+        if self.fill is None and self.shadow is None:
+            raise ValueError("transform deve ter ao menos fill ou shadow.")
+        return self
 
 # ---------------------------------------------------------------------------
 # Symbols
 # ---------------------------------------------------------------------------
 
-class SymbolSchema(BaseModel):
-    url: HttpUrl
+class ImageSymbolSchema(BaseModel):
+    type:           Literal["image"]
+    url:            HttpUrl
     baseline_align: BaselineAlign = BaselineAlign.center
+    height:         Optional[int] = Field(default=None, gt=0, description="Altura em px. Se omitido, usa o ascent da fonte.")
+
+
+class SvgSymbolSchema(BaseModel):
+    type:           Literal["svg_image"]
+    url:            HttpUrl
+    baseline_align: BaselineAlign = BaselineAlign.center
+    height:         Optional[int] = Field(default=None, gt=0, description="Altura em px. Se omitido, usa o ascent da fonte.")
+    transform:      Optional[SvgTransform] = None
+
+
+AnySymbol = Annotated[
+    Union[ImageSymbolSchema, SvgSymbolSchema],
+    Field(discriminator="type"),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -61,35 +122,46 @@ class SymbolSchema(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ImageLayerSchema(BaseModel):
-    order: int = Field(ge=0)
-    type: Literal["image"]
-    url: HttpUrl
-    x: int
-    y: int
-    width: Optional[int] = Field(default=None, gt=0)
-    height: Optional[int] = Field(default=None, gt=0)
-    opacity: float = Field(default=1.0, ge=0.0, le=1.0)
-    fit: FitMode = FitMode.none
+    order:   int   = Field(ge=0)
+    type:    Literal["image"]
+    url:     HttpUrl
+    x:       int
+    y:       int
+    width:   Optional[int]   = Field(default=None, gt=0)
+    height:  Optional[int]   = Field(default=None, gt=0)
+    opacity: float           = Field(default=1.0, ge=0.0, le=1.0)
+    fit:     FitMode         = FitMode.none
+
+
+class SvgImageLayerSchema(BaseModel):
+    order:     int   = Field(ge=0)
+    type:      Literal["svg_image"]
+    url:       HttpUrl
+    x:         int
+    y:         int
+    width:     Optional[int]   = Field(default=None, gt=0)
+    height:    Optional[int]   = Field(default=None, gt=0)
+    opacity:   float           = Field(default=1.0, ge=0.0, le=1.0)
+    transform: SvgTransform
 
 
 class TextLayerSchema(BaseModel):
-    order: int = Field(ge=0)
-    type: Literal["text"]
-    content: str = Field(min_length=1)
-    font_url: HttpUrl
-    font_size: int = Field(gt=0, le=1000)
-    color: str = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
-    x: int
-    y: int
-    max_width: Optional[int] = Field(default=None, gt=0)
-    line_height: float = Field(default=1.2, ge=0.5, le=5.0)
-    text_align: TextAlign = TextAlign.left
-    opacity: float = Field(default=1.0, ge=0.0, le=1.0)
+    order:       int   = Field(ge=0)
+    type:        Literal["text"]
+    content:     str   = Field(min_length=1)
+    font_url:    HttpUrl
+    font_size:   int   = Field(gt=0, le=1000)
+    color:       str   = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
+    x:           int
+    y:           int
+    max_width:   Optional[int]   = Field(default=None, gt=0)
+    line_height: float           = Field(default=1.2, ge=0.5, le=5.0)
+    text_align:  TextAlign       = TextAlign.left
+    opacity:     float           = Field(default=1.0, ge=0.0, le=1.0)
 
 
-# Union discriminada pelo campo "type"
 AnyLayer = Annotated[
-    Union[ImageLayerSchema, TextLayerSchema],
+    Union[ImageLayerSchema, SvgImageLayerSchema, TextLayerSchema],
     Field(discriminator="type"),
 ]
 
@@ -98,69 +170,57 @@ AnyLayer = Annotated[
 # Request principal
 # ---------------------------------------------------------------------------
 
+_SYMBOL_KEY_RE = re.compile(r"^\{[A-Za-z0-9_]+\}$")
+_SYMBOL_USE_RE = re.compile(r"\{[A-Za-z0-9_]+\}")
+
+
 class RenderRequest(BaseModel):
-    callback_url: Optional[HttpUrl] = None
-    canvas: CanvasSchema = Field(default_factory=CanvasSchema)
-    symbols_map: dict[str, SymbolSchema] = Field(default_factory=dict)
-    layers: list[AnyLayer] = Field(min_length=1)
+    callback_url: Optional[HttpUrl]    = None
+    canvas:       CanvasSchema         = Field(default_factory=CanvasSchema)
+    symbols_map:  dict[str, AnySymbol] = Field(default_factory=dict)
+    layers:       list[AnyLayer]       = Field(min_length=1)
 
     @field_validator("symbols_map")
     @classmethod
     def validate_symbol_keys(cls, v: dict) -> dict:
-        """Garante que as chaves sigam o padrão {KEY}."""
-        pattern = re.compile(r"^\{[A-Za-z0-9_]+\}$")
         for key in v:
-            if not pattern.match(key):
-                raise ValueError(
-                    f"Chave de símbolo inválida: '{key}'. "
-                    "Use o formato {NOME}, ex: {S1}, {SHIELD}."
-                )
+            if not _SYMBOL_KEY_RE.match(key):
+                raise ValueError(f"Chave invalida: '{key}'. Use o formato {{NOME}}.")
         return v
 
     @model_validator(mode="after")
-    def validate_symbols_referenced_in_layers(self) -> RenderRequest:
-        """
-        Verifica se todos os símbolos usados nos textos existem no symbols_map.
-        Evita erros silenciosos durante a renderização.
-        """
+    def validate_symbols_referenced(self) -> RenderRequest:
         if not self.symbols_map:
             return self
-
-        symbol_pattern = re.compile(r"\{[A-Za-z0-9_]+\}")
-        defined_keys = set(self.symbols_map.keys())
-
+        defined = set(self.symbols_map.keys())
         for layer in self.layers:
             if isinstance(layer, TextLayerSchema):
-                used = set(symbol_pattern.findall(layer.content))
-                undefined = used - defined_keys
+                used = set(_SYMBOL_USE_RE.findall(layer.content))
+                undefined = used - defined
                 if undefined:
                     raise ValueError(
-                        f"Símbolos usados no texto mas não definidos no symbols_map: "
-                        f"{undefined}. Conteúdo: '{layer.content}'"
+                        f"Simbolos usados mas nao definidos no symbols_map: {undefined}"
                     )
         return self
 
     @model_validator(mode="after")
     def sort_layers_by_order(self) -> RenderRequest:
-        """Ordena as camadas pela propriedade 'order' antes de processar."""
-        self.layers = sorted(self.layers, key=lambda layer: layer.order)
+        self.layers = sorted(self.layers, key=lambda l: l.order)
         return self
 
 
 # ---------------------------------------------------------------------------
-# Responses da API
+# Responses
 # ---------------------------------------------------------------------------
 
 class EnqueueResponse(BaseModel):
-    """Resposta do POST /render — retornado com HTTP 202."""
     task_id: str
-    status: TaskStatus = TaskStatus.processing
+    status:  TaskStatus = TaskStatus.processing
 
 
 class StatusResponse(BaseModel):
-    """Resposta do GET /status/{task_id}."""
-    task_id: str
-    status: TaskStatus
+    task_id:      str
+    status:       TaskStatus
     download_url: Optional[str] = None
-    expires_at: Optional[str] = None  # ISO 8601
-    error: Optional[str] = None
+    expires_at:   Optional[str] = None
+    error:        Optional[str] = None

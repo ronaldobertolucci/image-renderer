@@ -1,35 +1,28 @@
 """
 renderer.py
 -----------
-Motor de renderização: recebe um RenderRequest já validado e produz
-um arquivo PNG no caminho especificado.
+Motor de renderização: canvas → camadas image / svg_image / text (com símbolos inline).
 
-Fluxo principal:
-  render()
-    ├── _apply_image_layer()   → alpha_composite de imagens
-    └── _apply_text_layer()
-          ├── _parse_tokens()      → divide conteúdo em texto/símbolos
-          ├── _build_render_units() → transforma tokens em unidades com largura
-          ├── _build_lines()       → quebra de linha respeitando max_width
-          └── _render_line()       → renderiza cada linha (texto + símbolos)
+Pipeline SVG:
+  _rasterize_svg()       → CairoSVG converte SVG em RGBA em memória
+  _make_fill_layer()     → fill sólido ou gradiente do mesmo tamanho
+  _apply_svg_transform() → máscara alpha + fill + shadow compostos corretamente
 """
 
 import logging
 import re
+from io import BytesIO
 from pathlib import Path
 from typing import NamedTuple
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from app.schemas import (
-    AnyLayer,
-    BaselineAlign,
-    FitMode,
-    ImageLayerSchema,
-    RenderRequest,
-    SymbolSchema,
-    TextAlign,
-    TextLayerSchema,
+    AnyLayer, AnySymbol,
+    BaselineAlign, FillGradient, FillSolid,
+    FitMode, ImageLayerSchema, ImageSymbolSchema,
+    RenderRequest, Shadow, SvgImageLayerSchema,
+    SvgSymbolSchema, SvgTransform, TextAlign, TextLayerSchema,
 )
 from worker.asset_cache import fetch_asset
 
@@ -37,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Tipos internos
+# Tipos internos para unidades de renderização de texto
 # ---------------------------------------------------------------------------
 
 class WordUnit(NamedTuple):
@@ -49,9 +42,12 @@ class SpaceUnit(NamedTuple):
     width: int
 
 class SymbolUnit(NamedTuple):
-    image: Image.Image
-    width: int
-    baseline_align: BaselineAlign
+    image:           Image.Image
+    width:           int
+    baseline_align:  BaselineAlign
+    shadow_image:    Image.Image | None = None  # sombra pré-processada
+    shadow_offset_x: int = 0
+    shadow_offset_y: int = 0
 
 RenderUnit = WordUnit | SpaceUnit | SymbolUnit
 
@@ -61,77 +57,236 @@ RenderUnit = WordUnit | SpaceUnit | SymbolUnit
 # ---------------------------------------------------------------------------
 
 def _hex_to_rgba(hex_color: str, opacity: float = 1.0) -> tuple[int, int, int, int]:
-    """Converte '#RRGGBB' + opacidade para tupla RGBA."""
     h = hex_color.lstrip("#")
     r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
     return (r, g, b, int(opacity * 255))
 
 
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    h = hex_color.lstrip("#")
+    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+
+
 def _apply_opacity(image: Image.Image, opacity: float) -> Image.Image:
-    """Retorna uma cópia da imagem com o canal alfa multiplicado por opacity."""
     if opacity >= 1.0:
         return image.copy()
-
     img = image.convert("RGBA")
     r, g, b, a = img.split()
     a = a.point(lambda x: int(x * opacity))
     return Image.merge("RGBA", (r, g, b, a))
 
 
+def _safe_composite(canvas: Image.Image, layer: Image.Image, x: int, y: int) -> None:
+    """
+    Alpha-composite `layer` onto `canvas` at (x, y), lidando com coordenadas
+    negativas ou que ultrapassem os limites do canvas sem lançar exceção.
+    """
+    cw, ch = canvas.size
+    lw, lh = layer.size
+
+    if x >= cw or y >= ch:
+        return
+
+    src_x = max(0, -x)
+    src_y = max(0, -y)
+    dst_x = max(0, x)
+    dst_y = max(0, y)
+
+    crop_w = min(lw - src_x, cw - dst_x)
+    crop_h = min(lh - src_y, ch - dst_y)
+
+    if crop_w <= 0 or crop_h <= 0:
+        return
+
+    cropped = layer.crop((src_x, src_y, src_x + crop_w, src_y + crop_h))
+    canvas.alpha_composite(cropped, dest=(dst_x, dst_y))
+
+
 # ---------------------------------------------------------------------------
 # Redimensionamento de imagens (fit modes)
 # ---------------------------------------------------------------------------
 
-def _fit_image(
-    image: Image.Image,
-    target_w: int,
-    target_h: int,
-    fit: FitMode,
-) -> Image.Image:
-    """
-    Redimensiona `image` para (target_w, target_h) conforme o modo:
-    - cover:   preenche o alvo cortando o excesso (mantém proporção)
-    - contain: cabe inteiro dentro do alvo sem cortar
-    - none:    retorna sem alteração
-    """
+def _fit_image(image: Image.Image, target_w: int, target_h: int, fit: FitMode) -> Image.Image:
     if fit == FitMode.none:
         return image
-
     src_w, src_h = image.size
-
     if fit == FitMode.contain:
         ratio = min(target_w / src_w, target_h / src_h)
-        new_w, new_h = int(src_w * ratio), int(src_h * ratio)
-        return image.resize((new_w, new_h), Image.LANCZOS)
-
+        return image.resize((int(src_w * ratio), int(src_h * ratio)), Image.LANCZOS)
     # cover
     ratio = max(target_w / src_w, target_h / src_h)
     new_w, new_h = int(src_w * ratio), int(src_h * ratio)
     resized = image.resize((new_w, new_h), Image.LANCZOS)
-
-    # Centraliza e recorta
     left = (new_w - target_w) // 2
-    top = (new_h - target_h) // 2
+    top  = (new_h - target_h) // 2
     return resized.crop((left, top, left + target_w, top + target_h))
 
 
 # ---------------------------------------------------------------------------
-# Camadas de imagem
+# Pipeline SVG
+# ---------------------------------------------------------------------------
+
+def _rasterize_svg(path: Path, width: int | None = None, height: int | None = None) -> Image.Image:
+    """
+    Converte um arquivo SVG em RGBA usando CairoSVG.
+    width/height opcionais forçam o tamanho de saída.
+    """
+    import cairosvg
+    kwargs: dict = {}
+    if width:
+        kwargs["output_width"] = width
+    if height:
+        kwargs["output_height"] = height
+    png_bytes = cairosvg.svg2png(bytestring=path.read_bytes(), **kwargs)
+    return Image.open(BytesIO(png_bytes)).convert("RGBA")
+
+
+def _make_fill_layer(size: tuple[int, int], fill: FillSolid | FillGradient) -> Image.Image:
+    """Cria um layer de fill (sólido ou gradiente) no tamanho dado."""
+    if isinstance(fill, FillSolid):
+        return Image.new("RGBA", size, _hex_to_rgba(fill.color))
+
+    # Gradiente: interpola pixel a pixel ao longo do eixo definido
+    w, h = size
+    gradient = Image.new("RGB", size)
+    draw = ImageDraw.Draw(gradient)
+
+    stops = [_hex_to_rgb(c) for c in fill.colors]
+    n = len(stops) - 1
+
+    if fill.direction == "horizontal":
+        length = max(w - 1, 1)
+        for x in range(w):
+            t = x / length
+            seg = min(int(t * n), n - 1)
+            local_t = t * n - seg
+            c1, c2 = stops[seg], stops[seg + 1]
+            color = tuple(int(c1[i] + (c2[i] - c1[i]) * local_t) for i in range(3))
+            draw.line([(x, 0), (x, h - 1)], fill=color)
+    else:
+        length = max(h - 1, 1)
+        for y in range(h):
+            t = y / length
+            seg = min(int(t * n), n - 1)
+            local_t = t * n - seg
+            c1, c2 = stops[seg], stops[seg + 1]
+            color = tuple(int(c1[i] + (c2[i] - c1[i]) * local_t) for i in range(3))
+            draw.line([(0, y), (w - 1, y)], fill=color)
+
+    return gradient.convert("RGBA")
+
+
+def _apply_svg_transform(svg_img: Image.Image, transform: SvgTransform) -> Image.Image:
+    """
+    Aplica fill (sólido ou gradiente) e shadow a uma imagem SVG rasterizada.
+
+    Algoritmo:
+    1. Extrai o canal alpha do SVG como máscara de forma.
+    2. Cria o layer de fill e aplica a máscara.
+    3. Se shadow configurado:
+       a. Pinta a máscara com a cor da sombra.
+       b. Aplica GaussianBlur.
+       c. Usa canvas expandido para acomodar offset sem clip.
+       d. Compõe sombra atrás, fill na frente, e recorta ao tamanho original.
+    """
+    size = svg_img.size
+    _, _, _, alpha = svg_img.split()
+
+    # Fill: usa cor/gradiente definido ou mantém cores originais do SVG
+    if transform.fill is not None:
+        fill_layer = _make_fill_layer(size, transform.fill)
+        fill_layer.putalpha(alpha)
+    else:
+        fill_layer = svg_img.copy()
+
+    if not transform.shadow:
+        return fill_layer
+
+    s = transform.shadow
+    ox, oy = s.offset_x, s.offset_y
+    blur = s.blur_radius
+
+    # Shadow: pinta a forma com a cor da sombra e borra
+    shadow_color = _hex_to_rgb(s.color)
+    shadow_base = Image.new("RGBA", size, (*shadow_color, 255))
+    shadow_base.putalpha(alpha)
+    shadow_blurred = shadow_base.filter(ImageFilter.GaussianBlur(blur))
+
+    # Canvas expandido para garantir que shadow não seja clipada
+    pad_l = max(0, -ox) + blur
+    pad_r = max(0, +ox) + blur
+    pad_t = max(0, -oy) + blur
+    pad_b = max(0, +oy) + blur
+
+    tmp_w = size[0] + pad_l + pad_r
+    tmp_h = size[1] + pad_t + pad_b
+    tmp = Image.new("RGBA", (tmp_w, tmp_h), (0, 0, 0, 0))
+
+    # Sombra com offset
+    tmp.alpha_composite(shadow_blurred, dest=(pad_l + ox, pad_t + oy))
+    # Fill na posição original
+    tmp.alpha_composite(fill_layer, dest=(pad_l, pad_t))
+
+    # Recorta de volta ao tamanho original (shadow que saiu das bordas é clipada)
+    return tmp.crop((pad_l, pad_t, pad_l + size[0], pad_t + size[1]))
+
+
+# ---------------------------------------------------------------------------
+# Camadas de imagem (raster)
 # ---------------------------------------------------------------------------
 
 def _apply_image_layer(canvas: Image.Image, layer: ImageLayerSchema) -> None:
-    """Baixa, redimensiona e compõe uma camada de imagem no canvas."""
     path = fetch_asset(layer.url)
-    img = Image.open(path).convert("RGBA")
+    img  = Image.open(path).convert("RGBA")
 
-    target_w = layer.width or img.width
+    target_w = layer.width  or img.width
     target_h = layer.height or img.height
 
     img = _fit_image(img, target_w, target_h, layer.fit)
     img = _apply_opacity(img, layer.opacity)
 
-    canvas.alpha_composite(img, dest=(layer.x, layer.y))
-    logger.debug("Imagem aplicada: order=%d, pos=(%d,%d)", layer.order, layer.x, layer.y)
+    _safe_composite(canvas, img, layer.x, layer.y)
+    logger.debug("image layer order=%d pos=(%d,%d)", layer.order, layer.x, layer.y)
+
+
+# ---------------------------------------------------------------------------
+# Camadas SVG (raster + transform)
+# ---------------------------------------------------------------------------
+
+def _apply_svg_layer(canvas: Image.Image, layer: SvgImageLayerSchema) -> None:
+    """
+    Pipeline completo para um layer do tipo svg_image:
+    rasteriza → aplica fill + shadow → compõe no canvas.
+
+    A shadow que extrapola os limites do ícone é colocada no canvas
+    separadamente, antes do ícone, com o offset configurado.
+    """
+    path = fetch_asset(layer.url)
+    svg_img = _rasterize_svg(path, layer.width, layer.height)
+
+    _, _, _, alpha = svg_img.split()
+    s = layer.transform.shadow
+
+    # 1. Fill com máscara (ou cores originais do SVG se fill=None)
+    if layer.transform.fill is not None:
+        fill_layer = _make_fill_layer(svg_img.size, layer.transform.fill)
+        fill_layer.putalpha(alpha)
+    else:
+        fill_layer = svg_img.copy()
+    fill_layer = _apply_opacity(fill_layer, layer.opacity)
+
+    # 2. Shadow no canvas diretamente (permite que extrapole a área do ícone)
+    if s:
+        shadow_color = _hex_to_rgb(s.color)
+        shadow_base  = Image.new("RGBA", svg_img.size, (*shadow_color, 255))
+        shadow_base.putalpha(alpha)
+        shadow_blurred = shadow_base.filter(ImageFilter.GaussianBlur(s.blur_radius))
+        shadow_blurred = _apply_opacity(shadow_blurred, layer.opacity)
+        _safe_composite(canvas, shadow_blurred, layer.x + s.offset_x, layer.y + s.offset_y)
+
+    # 3. Fill (ícone principal) por cima
+    _safe_composite(canvas, fill_layer, layer.x, layer.y)
+    logger.debug("svg_image layer order=%d pos=(%d,%d)", layer.order, layer.x, layer.y)
 
 
 # ---------------------------------------------------------------------------
@@ -141,17 +296,7 @@ def _apply_image_layer(canvas: Image.Image, layer: ImageLayerSchema) -> None:
 _SYMBOL_RE = re.compile(r"(\{[A-Za-z0-9_]+\})")
 
 
-def _parse_tokens(content: str, symbols_map: dict[str, SymbolSchema]) -> list[dict]:
-    """
-    Divide o conteúdo em tokens de texto e símbolos.
-
-    Exemplo:
-      "Ataque {S2} com Força!" → [
-        {"type": "text",   "content": "Ataque "},
-        {"type": "symbol", "key": "{S2}"},
-        {"type": "text",   "content": " com Força!"},
-      ]
-    """
+def _parse_tokens(content: str, symbols_map: dict[str, AnySymbol]) -> list[dict]:
     tokens = []
     for part in _SYMBOL_RE.split(content):
         if not part:
@@ -168,89 +313,145 @@ def _parse_tokens(content: str, symbols_map: dict[str, SymbolSchema]) -> list[di
 # ---------------------------------------------------------------------------
 
 def _text_width(text: str, font: ImageFont.FreeTypeFont) -> int:
-    """Largura em pixels de uma string com a fonte dada."""
     bbox = font.getbbox(text)
     return bbox[2] - bbox[0]
 
 
 def _scale_symbol(img: Image.Image, target_height: int) -> Image.Image:
-    """Redimensiona símbolo mantendo proporção, com altura = target_height."""
     ratio = target_height / img.height
     new_w = max(1, int(img.width * ratio))
     return img.resize((new_w, target_height), Image.LANCZOS)
 
 
-def _build_render_units(
-    tokens: list[dict],
-    font: ImageFont.FreeTypeFont,
-    symbol_images: dict[str, tuple[Image.Image, BaselineAlign]],
-) -> list[RenderUnit]:
+def _load_symbol_image(
+    schema: AnySymbol,
+    ascent: int,
+) -> tuple[Image.Image, BaselineAlign, Image.Image | None, int, int]:
     """
-    Converte tokens em unidades atômicas de renderização com largura pré-calculada.
-    Texto é dividido em palavras e espaços para permitir quebra de linha.
-    """
-    units: list[RenderUnit] = []
+    Baixa e processa um símbolo, retornando fill e sombra separadamente.
 
+    A sombra é retornada como imagem independente para ser composta no canvas
+    ANTES do fill, sem clipping pelos limites do símbolo.
+
+    Retorna: (fill_img, baseline_align, shadow_img | None, shadow_ox, shadow_oy)
+    """
+    target_h = schema.height if schema.height else ascent
+    path     = fetch_asset(schema.url)
+
+    if isinstance(schema, ImageSymbolSchema):
+        img = Image.open(path).convert("RGBA")
+        img = _scale_symbol(img, target_h)
+        return img, schema.baseline_align, None, 0, 0
+
+    # SvgSymbolSchema
+    img = _rasterize_svg(path, height=target_h)
+
+    shadow_img: Image.Image | None = None
+    shadow_ox = shadow_oy = 0
+
+    if schema.transform:
+        _, _, _, alpha = img.split()
+
+        # Fill: recolore ou mantém cores originais
+        if schema.transform.fill is not None:
+            fill_layer = _make_fill_layer(img.size, schema.transform.fill)
+            fill_layer.putalpha(alpha)
+            img = fill_layer
+
+        # Shadow com canvas expandido para evitar clipping por blur e offset
+        if schema.transform.shadow:
+            s = schema.transform.shadow
+            _, _, _, alpha_for_shadow = img.split()
+
+            # Padding: acomoda blur (em todos os lados) + offset (no lado oposto)
+            pad_l = max(0, -s.offset_x) + s.blur_radius
+            pad_r = max(0,  s.offset_x) + s.blur_radius
+            pad_t = max(0, -s.offset_y) + s.blur_radius
+            pad_b = max(0,  s.offset_y) + s.blur_radius
+
+            padded_w = img.width  + pad_l + pad_r
+            padded_h = img.height + pad_t + pad_b
+
+            # Coloca a máscara alpha no centro do canvas expandido
+            padded_alpha = Image.new("L", (padded_w, padded_h), 0)
+            padded_alpha.paste(alpha_for_shadow, (pad_l, pad_t))
+
+            shadow_color_rgb = _hex_to_rgb(s.color)
+            shadow_base = Image.new("RGBA", (padded_w, padded_h), (*shadow_color_rgb, 255))
+            shadow_base.putalpha(padded_alpha)
+            shadow_blurred = shadow_base.filter(ImageFilter.GaussianBlur(s.blur_radius))
+
+            # Aplica opacity da sombra boost no canal alpha
+            if s.opacity < 1.0:
+                sr, sg, sb, sa = shadow_blurred.split()
+                sa = sa.point(lambda v: int(v * s.opacity))
+                shadow_blurred = Image.merge("RGBA", (sr, sg, sb, sa))
+
+            shadow_img = shadow_blurred
+
+            # Offset de renderização: posiciona o canvas expandido corretamente
+            # O conteúdo do shadow está em (pad_l, pad_t) no canvas expandido.
+            # Queremos que a sombra apareça em (offset_x, offset_y) do símbolo.
+            # → canvas_topleft = symbol_pos + (offset_x - pad_l, offset_y - pad_t)
+            shadow_ox = s.offset_x - pad_l
+            shadow_oy = s.offset_y - pad_t
+
+    # img já foi rasterizado em target_h; _scale_symbol é no-op ou correção fina
+    img = _scale_symbol(img, target_h)
+
+    return img, schema.baseline_align, shadow_img, shadow_ox, shadow_oy
+
+
+def _build_render_units(
+    tokens:        list[dict],
+    font:          ImageFont.FreeTypeFont,
+    symbol_images: dict[str, tuple],
+) -> list[RenderUnit]:
+    units: list[RenderUnit] = []
     for token in tokens:
         if token["type"] == "symbol":
-            img, align = symbol_images[token["key"]]
-            units.append(SymbolUnit(image=img, width=img.width, baseline_align=align))
-
+            img, align, shadow_img, shadow_ox, shadow_oy = symbol_images[token["key"]]
+            units.append(SymbolUnit(
+                image=img, width=img.width, baseline_align=align,
+                shadow_image=shadow_img, shadow_offset_x=shadow_ox, shadow_offset_y=shadow_oy,
+            ))
         else:
-            # Divide em sequências de não-espaço e espaço
-            subparts = re.findall(r"\S+|\s+", token["content"])
-            for subpart in subparts:
+            for subpart in re.findall(r"\S+|\s+", token["content"]):
                 w = _text_width(subpart, font)
                 if subpart.strip() == "":
                     units.append(SpaceUnit(text=subpart, width=w))
                 else:
                     units.append(WordUnit(text=subpart, width=w))
-
     return units
 
 
 # ---------------------------------------------------------------------------
-# Quebra de linha (word-wrap)
+# Quebra de linha
 # ---------------------------------------------------------------------------
 
-def _build_lines(
-    units: list[RenderUnit],
-    max_width: int | None,
-) -> list[list[RenderUnit]]:
-    """
-    Agrupa unidades em linhas respeitando max_width.
-    Espaços no início e no final de cada linha são descartados.
-    Se max_width for None, retorna uma única linha com tudo.
-    """
+def _build_lines(units: list[RenderUnit], max_width: int | None) -> list[list[RenderUnit]]:
     if max_width is None:
         return [units]
 
     lines: list[list[RenderUnit]] = []
-    current: list[RenderUnit] = []
+    current: list[RenderUnit]     = []
     current_w = 0
 
     for unit in units:
-        # Descarta espaços no início de uma nova linha
         if not current and isinstance(unit, SpaceUnit):
             continue
-
         if current_w + unit.width > max_width and current:
-            # Remove espaços finais antes de fechar a linha
             while current and isinstance(current[-1], SpaceUnit):
                 current_w -= current[-1].width
                 current.pop()
             if current:
                 lines.append(current)
-            # Inicia nova linha (descartando espaços)
-            if isinstance(unit, SpaceUnit):
-                current, current_w = [], 0
-            else:
-                current, current_w = [unit], unit.width
+            current   = [] if isinstance(unit, SpaceUnit) else [unit]
+            current_w = 0  if isinstance(unit, SpaceUnit) else unit.width
         else:
             current.append(unit)
             current_w += unit.width
 
-    # Última linha
     while current and isinstance(current[-1], SpaceUnit):
         current.pop()
     if current:
@@ -263,29 +464,24 @@ def _build_lines(
 # Renderização de uma linha
 # ---------------------------------------------------------------------------
 
-def _line_pixel_width(line: list[RenderUnit]) -> int:
+def _line_width(line: list[RenderUnit]) -> int:
     return sum(u.width for u in line)
 
 
 def _render_line(
-    canvas: Image.Image,
-    draw: ImageDraw.ImageDraw,
-    line: list[RenderUnit],
-    layer: TextLayerSchema,
-    line_y: int,
-    font: ImageFont.FreeTypeFont,
+    canvas:     Image.Image,
+    draw:       ImageDraw.ImageDraw,
+    line:       list[RenderUnit],
+    layer:      TextLayerSchema,
+    line_y:     int,
+    font:       ImageFont.FreeTypeFont,
     color_rgba: tuple,
-    line_h: int,
-    ascent: int,
+    line_h:     int,
+    ascent:     int,
 ) -> None:
-    """
-    Renderiza uma única linha de unidades no canvas.
-    Gerencia alinhamento horizontal e vertical dos símbolos inline.
-    """
-    lw = _line_pixel_width(line)
-    max_w = layer.max_width
+    lw     = _line_width(line)
+    max_w  = layer.max_width
 
-    # Posição X inicial conforme alinhamento
     if layer.text_align == TextAlign.center and max_w:
         x = layer.x + (max_w - lw) // 2
     elif layer.text_align == TextAlign.right and max_w:
@@ -299,24 +495,27 @@ def _render_line(
             x += unit.width
 
         elif isinstance(unit, SymbolUnit):
-            img = unit.image
-            sym_h = img.height
-
-            # Alinhamento vertical do símbolo na linha
+            sym_h = unit.image.height
             if unit.baseline_align == BaselineAlign.top:
                 sym_y = line_y
             elif unit.baseline_align == BaselineAlign.baseline:
-                # Alinha a base do símbolo com a linha de base do texto
                 sym_y = line_y + ascent - sym_h
             else:
-                # center: centraliza na altura total da linha
                 sym_y = line_y + (line_h - sym_h) // 2
 
-            sym_y = max(0, sym_y)  # garante que não saia do canvas pelo topo
+            sym_y_int = max(0, int(sym_y))
 
-            # Compõe o símbolo com opacidade da camada
-            sym = _apply_opacity(img.convert("RGBA"), layer.opacity)
-            canvas.alpha_composite(sym, dest=(int(x), int(sym_y)))
+            # Sombra composta ANTES do fill, sem clipping pelos limites do símbolo
+            if unit.shadow_image is not None:
+                shadow = _apply_opacity(unit.shadow_image, layer.opacity)
+                _safe_composite(
+                    canvas, shadow,
+                    int(x) + unit.shadow_offset_x,
+                    sym_y_int + unit.shadow_offset_y,
+                )
+
+            sym = _apply_opacity(unit.image.convert("RGBA"), layer.opacity)
+            _safe_composite(canvas, sym, int(x), sym_y_int)
             x += unit.width
 
 
@@ -325,53 +524,40 @@ def _render_line(
 # ---------------------------------------------------------------------------
 
 def _apply_text_layer(
-    canvas: Image.Image,
-    layer: TextLayerSchema,
-    symbols_map: dict[str, SymbolSchema],
+    canvas:      Image.Image,
+    layer:       TextLayerSchema,
+    symbols_map: dict[str, AnySymbol],
 ) -> None:
-    """Renderiza uma camada de texto (com possíveis símbolos inline) no canvas."""
-
-    # Carrega fonte
     font_path = fetch_asset(layer.font_url)
-    font = ImageFont.truetype(str(font_path), size=layer.font_size)
+    font      = ImageFont.truetype(str(font_path), size=layer.font_size)
 
-    ascent, descent = font.getmetrics()
-    line_h = int(layer.font_size * layer.line_height)
+    ascent, _ = font.getmetrics()
+    line_h    = int(layer.font_size * layer.line_height)
 
-    # Carrega e escala as imagens de símbolos usados nesta camada
+    # Pré-carrega e escala todos os símbolos usados nesta camada
     symbol_images: dict[str, tuple[Image.Image, BaselineAlign]] = {}
-    symbol_pattern = re.compile(r"\{[A-Za-z0-9_]+\}")
-    used_keys = set(symbol_pattern.findall(layer.content))
+    used_keys = set(re.findall(r"\{[A-Za-z0-9_]+\}", layer.content))
 
     for key in used_keys:
         schema = symbols_map[key]
-        path = fetch_asset(schema.url)
-        img = Image.open(path).convert("RGBA")
-        img = _scale_symbol(img, ascent)  # escala para a altura do ascent
-        symbol_images[key] = (img, schema.baseline_align)
+        symbol_images[key] = _load_symbol_image(schema, ascent)  # (img, align, shadow, ox, oy)
 
-    # Parsing e layout
-    tokens = _parse_tokens(layer.content, symbols_map)
-    units = _build_render_units(tokens, font, symbol_images)
-    lines = _build_lines(units, layer.max_width)
+    tokens  = _parse_tokens(layer.content, symbols_map)
+    units   = _build_render_units(tokens, font, symbol_images)
+    lines   = _build_lines(units, layer.max_width)
 
-    # Cria draw overlay com opacidade para o texto
-    overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-    color_rgba = _hex_to_rgba(layer.color, layer.opacity)
+    overlay     = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    draw        = ImageDraw.Draw(overlay)
+    color_rgba  = _hex_to_rgba(layer.color, layer.opacity)
 
     for i, line in enumerate(lines):
-        line_y = layer.y + i * line_h
         _render_line(
             overlay, draw, line, layer,
-            line_y, font, color_rgba, line_h, ascent,
+            layer.y + i * line_h, font, color_rgba, line_h, ascent,
         )
 
     canvas.alpha_composite(overlay)
-    logger.debug(
-        "Texto aplicado: order=%d, linhas=%d, pos=(%d,%d)",
-        layer.order, len(lines), layer.x, layer.y,
-    )
+    logger.debug("text layer order=%d lines=%d pos=(%d,%d)", layer.order, len(lines), layer.x, layer.y)
 
 
 # ---------------------------------------------------------------------------
@@ -379,26 +565,23 @@ def _apply_text_layer(
 # ---------------------------------------------------------------------------
 
 def render(request: RenderRequest, output_path: Path) -> None:
-    """
-    Renderiza a imagem completa a partir do RenderRequest e salva em output_path.
-
-    As camadas já vêm ordenadas pelo schema (sort_layers_by_order).
-    """
+    """Renderiza a imagem completa e salva em output_path."""
     logger.info(
-        "Iniciando renderização: %dx%d, %d camadas",
+        "Iniciando renderizacao: %dx%d, %d camadas",
         request.canvas.width, request.canvas.height, len(request.layers),
     )
 
-    bg_color = _hex_to_rgba(request.canvas.background_color)
-    canvas = Image.new("RGBA", (request.canvas.width, request.canvas.height), bg_color)
+    bg     = _hex_to_rgba(request.canvas.background_color)
+    canvas = Image.new("RGBA", (request.canvas.width, request.canvas.height), bg)
 
     for layer in request.layers:
         if isinstance(layer, ImageLayerSchema):
             _apply_image_layer(canvas, layer)
+        elif isinstance(layer, SvgImageLayerSchema):
+            _apply_svg_layer(canvas, layer)
         elif isinstance(layer, TextLayerSchema):
             _apply_text_layer(canvas, layer, request.symbols_map)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.convert("RGB").save(str(output_path), format="PNG", optimize=True)
-
-    logger.info("Renderização concluída: %s", output_path)
+    logger.info("Renderizacao concluida: %s", output_path)
