@@ -1,0 +1,84 @@
+services:
+
+  # ---------------------------------------------------------------------------
+  # Redis — broker de mensagens e backend de estado
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis_data:/data
+
+  # ---------------------------------------------------------------------------
+  # API — FastAPI recebe requisições e enfileira tasks
+  # ---------------------------------------------------------------------------
+  api:
+    build: .
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - generated:/tmp/generated      # lê os arquivos para servir no /download
+      - asset_cache:/tmp/asset_cache  # compartilhado com o worker
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import httpx; httpx.get('http://localhost:8000/health').raise_for_status()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # Worker — Celery processa as tasks de renderização
+  # ---------------------------------------------------------------------------
+  worker:
+    build: .
+    command: >
+      celery -A worker.celery_app worker
+      --loglevel=info
+      --concurrency=${CELERY_CONCURRENCY:-4}
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - generated:/tmp/generated      # escreve as imagens geradas
+      - asset_cache:/tmp/asset_cache  # cache de fontes e imagens externas
+    # Limite de memória por container — ajuste conforme o servidor
+    # 4 workers × ~22 MB por imagem RGBA + overhead ≈ 512 MB é razoável
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # Beat — agendador do Celery (executa cleanup a cada hora)
+  # Roda um único processo; nunca escale beat horizontalmente
+  # ---------------------------------------------------------------------------
+  beat:
+    build: .
+    command: celery -A worker.celery_app beat --loglevel=info
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      redis:
+        condition: service_healthy
+
+# ---------------------------------------------------------------------------
+# Volumes nomeados — compartilhados entre api e worker
+# ---------------------------------------------------------------------------
+volumes:
+  redis_data:
+  generated:
+  asset_cache:
