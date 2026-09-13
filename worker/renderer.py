@@ -523,6 +523,18 @@ def _render_line(
 # Camada de texto
 # ---------------------------------------------------------------------------
 
+def _normalize_content(content: str, tab_size: int) -> str:
+    """
+    Normaliza sequências de escape do conteúdo de texto:
+    - \r\n e \r  → \n  (quebras de linha Windows/Mac antigo)
+    - \t          → N espaços (tab_size espaços)
+    Newlines e tabs reais (vindos do JSON) já chegam processados pelo parser.
+    """
+    content = content.replace("\r\n", "\n").replace("\r", "\n")
+    content = content.replace("\t", " " * tab_size)
+    return content
+
+
 def _apply_text_layer(
     canvas:      Image.Image,
     layer:       TextLayerSchema,
@@ -534,30 +546,46 @@ def _apply_text_layer(
     ascent, _ = font.getmetrics()
     line_h    = int(layer.font_size * layer.line_height)
 
-    # Pré-carrega e escala todos os símbolos usados nesta camada
-    symbol_images: dict[str, tuple[Image.Image, BaselineAlign]] = {}
-    used_keys = set(re.findall(r"\{[A-Za-z0-9_]+\}", layer.content))
+    # Normaliza escapes e divide em parágrafos pelo \n
+    normalized = _normalize_content(layer.content, layer.tab_size)
+    paragraphs = normalized.split("\n")
 
+    # Pré-carrega símbolos usados em qualquer parágrafo
+    symbol_images: dict[str, tuple] = {}
+    used_keys = set(re.findall(r"\{[A-Za-z0-9_]+\}", normalized))
     for key in used_keys:
-        schema = symbols_map[key]
-        symbol_images[key] = _load_symbol_image(schema, ascent)  # (img, align, shadow, ox, oy)
+        symbol_images[key] = _load_symbol_image(symbols_map[key], ascent)
 
-    tokens  = _parse_tokens(layer.content, symbols_map)
-    units   = _build_render_units(tokens, font, symbol_images)
-    lines   = _build_lines(units, layer.max_width)
+    overlay    = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    draw       = ImageDraw.Draw(overlay)
+    color_rgba = _hex_to_rgba(layer.color, layer.opacity)
 
-    overlay     = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
-    draw        = ImageDraw.Draw(overlay)
-    color_rgba  = _hex_to_rgba(layer.color, layer.opacity)
+    current_y   = layer.y
+    total_lines = 0
 
-    for i, line in enumerate(lines):
-        _render_line(
-            overlay, draw, line, layer,
-            layer.y + i * line_h, font, color_rgba, line_h, ascent,
-        )
+    for p_idx, paragraph in enumerate(paragraphs):
+        tokens = _parse_tokens(paragraph, symbols_map)
+        units  = _build_render_units(tokens, font, symbol_images)
+        lines  = _build_lines(units, layer.max_width)
+
+        if not lines:
+            # Parágrafo vazio (\n consecutivos): avança uma linha em branco
+            current_y += line_h
+        else:
+            for line in lines:
+                _render_line(overlay, draw, line, layer, current_y, font, color_rgba, line_h, ascent)
+                current_y += line_h
+            total_lines += len(lines)
+
+        # Espaçamento extra entre parágrafos (não após o último)
+        if p_idx < len(paragraphs) - 1:
+            current_y += layer.paragraph_spacing
 
     canvas.alpha_composite(overlay)
-    logger.debug("text layer order=%d lines=%d pos=(%d,%d)", layer.order, len(lines), layer.x, layer.y)
+    logger.debug(
+        "text layer order=%d paragraphs=%d lines=%d pos=(%d,%d)",
+        layer.order, len(paragraphs), total_lines, layer.x, layer.y,
+    )
 
 
 # ---------------------------------------------------------------------------

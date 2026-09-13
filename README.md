@@ -442,6 +442,8 @@ Todas as camadas têm `order` (inteiro, define a ordem de composição, menor = 
   "y": 500,
   "max_width": 1792,
   "line_height": 1.2,
+  "paragraph_spacing": 20,
+  "tab_size": 4,
   "text_align": "left",
   "opacity": 1.0
 }
@@ -456,8 +458,36 @@ Todas as camadas têm `order` (inteiro, define a ordem de composição, menor = 
 | `x`, `y` | int | — | Posição do bloco de texto no canvas |
 | `max_width` | int | `null` | Largura máxima em px para quebra de linha automática |
 | `line_height` | float | `1.2` | Multiplicador de entrelinha (1.2 = 120% do font_size) |
+| `paragraph_spacing` | int | `0` | Pixels extras adicionados entre parágrafos (separados por `\n`) |
+| `tab_size` | int | `4` | Quantidade de espaços equivalentes por `\t` |
 | `text_align` | `"left"` \| `"center"` \| `"right"` | `"left"` | Alinhamento horizontal (requer `max_width`) |
 | `opacity` | float 0–1 | `1.0` | Opacidade do texto e dos símbolos inline |
+
+---
+
+### Sequências de Escape em Texto
+
+O campo `content` das camadas de texto suporta as seguintes sequências:
+
+| Sequência | Efeito |
+|---|---|
+| `\n` | Quebra de linha / novo parágrafo |
+| `\t` | Tabulação horizontal (equivalente a `tab_size` espaços) |
+| `\r\n` | Quebra de linha Windows (normalizada automaticamente para `\n`) |
+| `\\` | Barra invertida literal |
+
+**Parágrafos consecutivos** — dois `\n` seguidos criam uma linha em branco entre blocos de texto.
+
+**Exemplo:**
+```json
+{
+  "type": "text",
+  "content": "Título\n\nPrimeiro parágrafo.\nSegunda linha.\n\n\tTexto indentado.",
+  "paragraph_spacing": 24,
+  "tab_size": 4,
+  "font_size": 48
+}
+```
 
 ---
 

@@ -154,10 +154,14 @@ class TextLayerSchema(BaseModel):
     color:       str   = Field(pattern=r"^#[0-9A-Fa-f]{6}$")
     x:           int
     y:           int
-    max_width:   Optional[int]   = Field(default=None, gt=0)
-    line_height: float           = Field(default=1.2, ge=0.5, le=5.0)
-    text_align:  TextAlign       = TextAlign.left
-    opacity:     float           = Field(default=1.0, ge=0.0, le=1.0)
+    max_width:         Optional[int] = Field(default=None, gt=0)
+    line_height:       float        = Field(default=1.2, ge=0.5, le=5.0)
+    paragraph_spacing: int          = Field(default=0, ge=0,
+                                            description="Pixels extras entre paragrafos (separados por \\n).")
+    tab_size:          int          = Field(default=4, ge=1, le=32,
+                                            description="Espacos equivalentes por \\t.")
+    text_align:        TextAlign    = TextAlign.left
+    opacity:           float        = Field(default=1.0, ge=0.0, le=1.0)
 
 
 AnyLayer = Annotated[
