@@ -444,6 +444,8 @@ Todas as camadas têm `order` (inteiro, define a ordem de composição, menor = 
   "line_height": 1.2,
   "paragraph_spacing": 20,
   "tab_size": 4,
+  "word_spacing": 8,
+  "symbol_spacing": 12,
   "text_align": "left",
   "opacity": 1.0
 }
@@ -460,6 +462,8 @@ Todas as camadas têm `order` (inteiro, define a ordem de composição, menor = 
 | `line_height` | float | `1.2` | Multiplicador de entrelinha (1.2 = 120% do font_size) |
 | `paragraph_spacing` | int | `0` | Pixels extras adicionados entre parágrafos (separados por `\n`) |
 | `tab_size` | int | `4` | Quantidade de espaços equivalentes por `\t` |
+| `word_spacing` | int | `0` | Pixels extras entre palavras. Negativo aproxima, positivo afasta |
+| `symbol_spacing` | int | `0` | Pixels de margem em cada lado de um símbolo inline |
 | `text_align` | `"left"` \| `"center"` \| `"right"` | `"left"` | Alinhamento horizontal (requer `max_width`) |
 | `opacity` | float 0–1 | `1.0` | Opacidade do texto e dos símbolos inline |
 

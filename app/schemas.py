@@ -160,6 +160,10 @@ class TextLayerSchema(BaseModel):
                                             description="Pixels extras entre paragrafos (separados por \\n).")
     tab_size:          int          = Field(default=4, ge=1, le=32,
                                             description="Espacos equivalentes por \\t.")
+    word_spacing:      int          = Field(default=0, ge=-200, le=1000,
+                                            description="Pixels extras entre palavras. Negativo aproxima, positivo afasta.")
+    symbol_spacing:    int          = Field(default=0, ge=-100, le=500,
+                                            description="Pixels de margem em cada lado de um simbolo inline.")
     text_align:        TextAlign    = TextAlign.left
     opacity:           float        = Field(default=1.0, ge=0.0, le=1.0)
 

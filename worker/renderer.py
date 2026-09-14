@@ -43,11 +43,12 @@ class SpaceUnit(NamedTuple):
 
 class SymbolUnit(NamedTuple):
     image:           Image.Image
-    width:           int
+    width:           int              # largura total incluindo padding (symbol_spacing * 2)
     baseline_align:  BaselineAlign
-    shadow_image:    Image.Image | None = None  # sombra pré-processada
+    shadow_image:    Image.Image | None = None
     shadow_offset_x: int = 0
     shadow_offset_y: int = 0
+    padding_x:       int = 0         # deslocamento interno para centralizar o símbolo no unit
 
 RenderUnit = WordUnit | SpaceUnit | SymbolUnit
 
@@ -313,6 +314,7 @@ def _parse_tokens(content: str, symbols_map: dict[str, AnySymbol]) -> list[dict]
 # ---------------------------------------------------------------------------
 
 def _text_width(text: str, font: ImageFont.FreeTypeFont) -> int:
+    """Largura em pixels de uma string com a fonte dada."""
     bbox = font.getbbox(text)
     return bbox[2] - bbox[0]
 
@@ -403,23 +405,29 @@ def _load_symbol_image(
 
 
 def _build_render_units(
-    tokens:        list[dict],
-    font:          ImageFont.FreeTypeFont,
-    symbol_images: dict[str, tuple],
+    tokens:         list[dict],
+    font:           ImageFont.FreeTypeFont,
+    symbol_images:  dict[str, tuple],
+    word_spacing:   int = 0,
+    symbol_spacing: int = 0,
 ) -> list[RenderUnit]:
     units: list[RenderUnit] = []
     for token in tokens:
         if token["type"] == "symbol":
             img, align, shadow_img, shadow_ox, shadow_oy = symbol_images[token["key"]]
+            # symbol_spacing adiciona margem em cada lado do símbolo
+            total_w = img.width + symbol_spacing * 2
             units.append(SymbolUnit(
-                image=img, width=img.width, baseline_align=align,
+                image=img, width=total_w, baseline_align=align,
                 shadow_image=shadow_img, shadow_offset_x=shadow_ox, shadow_offset_y=shadow_oy,
+                padding_x=symbol_spacing,
             ))
         else:
             for subpart in re.findall(r"\S+|\s+", token["content"]):
                 w = _text_width(subpart, font)
                 if subpart.strip() == "":
-                    units.append(SpaceUnit(text=subpart, width=w))
+                    # word_spacing aumenta/diminui o espaço entre palavras
+                    units.append(SpaceUnit(text=subpart, width=max(0, w + word_spacing)))
                 else:
                     units.append(WordUnit(text=subpart, width=w))
     return units
@@ -504,19 +512,20 @@ def _render_line(
                 sym_y = line_y + (line_h - sym_h) // 2
 
             sym_y_int = max(0, int(sym_y))
+            sym_x_int = int(x) + unit.padding_x  # padding_x = symbol_spacing
 
             # Sombra composta ANTES do fill, sem clipping pelos limites do símbolo
             if unit.shadow_image is not None:
                 shadow = _apply_opacity(unit.shadow_image, layer.opacity)
                 _safe_composite(
                     canvas, shadow,
-                    int(x) + unit.shadow_offset_x,
+                    sym_x_int + unit.shadow_offset_x,
                     sym_y_int + unit.shadow_offset_y,
                 )
 
             sym = _apply_opacity(unit.image.convert("RGBA"), layer.opacity)
-            _safe_composite(canvas, sym, int(x), sym_y_int)
-            x += unit.width
+            _safe_composite(canvas, sym, sym_x_int, sym_y_int)
+            x += unit.width  # avança pela largura total (imagem + padding dos dois lados)
 
 
 # ---------------------------------------------------------------------------
@@ -565,7 +574,7 @@ def _apply_text_layer(
 
     for p_idx, paragraph in enumerate(paragraphs):
         tokens = _parse_tokens(paragraph, symbols_map)
-        units  = _build_render_units(tokens, font, symbol_images)
+        units  = _build_render_units(tokens, font, symbol_images, layer.word_spacing, layer.symbol_spacing)
         lines  = _build_lines(units, layer.max_width)
 
         if not lines:
