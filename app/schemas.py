@@ -26,6 +26,11 @@ class TextAlign(str, Enum):
     center = "center"
     right  = "right"
 
+class VerticalAlign(str, Enum):
+    top    = "top"
+    center = "center"
+    bottom = "bottom"
+
 class TaskStatus(str, Enum):
     processing = "processing"
     completed  = "completed"
@@ -164,8 +169,11 @@ class TextLayerSchema(BaseModel):
                                             description="Pixels extras entre palavras. Negativo aproxima, positivo afasta.")
     symbol_spacing:    int          = Field(default=0, ge=-100, le=500,
                                             description="Pixels de margem em cada lado de um simbolo inline.")
-    text_align:        TextAlign    = TextAlign.left
-    opacity:           float        = Field(default=1.0, ge=0.0, le=1.0)
+    max_height:        Optional[int] = Field(default=None, gt=0,
+                                             description="Altura maxima em px. Usado com vertical_align para centralizar o bloco de texto.")
+    vertical_align:    VerticalAlign = VerticalAlign.top
+    text_align:        TextAlign     = TextAlign.left
+    opacity:           float         = Field(default=1.0, ge=0.0, le=1.0)
 
 
 AnyLayer = Annotated[

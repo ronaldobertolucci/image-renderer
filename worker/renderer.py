@@ -23,6 +23,7 @@ from app.schemas import (
     FitMode, ImageLayerSchema, ImageSymbolSchema,
     RenderRequest, Shadow, SvgImageLayerSchema,
     SvgSymbolSchema, SvgTransform, TextAlign, TextLayerSchema,
+    VerticalAlign,
 )
 from worker.asset_cache import fetch_asset
 
@@ -544,6 +545,60 @@ def _normalize_content(content: str, tab_size: int) -> str:
     return content
 
 
+def _measure_text_block(
+    paragraphs:    list[str],
+    font:          ImageFont.FreeTypeFont,
+    symbol_images: dict[str, tuple],
+    layer:         TextLayerSchema,
+    line_h:        int,
+) -> int:
+    """
+    Calcula a altura total do bloco de texto em pixels.
+    """
+    ascent, descent = font.getmetrics()
+    
+    # CORREÇÃO:
+    # Substituímos `ascent + descent` por apenas `ascent`.
+    # Isso faz a centralização ignorar o espaço do descent fantasma,
+    # mantendo o texto perfeitamente centralizado usando a linha de base.
+    visual_last_line_h = ascent 
+
+    total = 0
+    last_p_idx = len(paragraphs) - 1
+
+    for p_idx, paragraph in enumerate(paragraphs):
+        tokens = _parse_tokens(paragraph, {})
+        units  = _build_render_units(tokens, font, symbol_images,
+                                     layer.word_spacing, layer.symbol_spacing)
+        lines  = _build_lines(units, layer.max_width)
+        n = 1 if not lines else len(lines)
+
+        if p_idx < last_p_idx:
+            # Parágrafos intermediários: todas as linhas usam line_h
+            total += n * line_h + layer.paragraph_spacing
+        else:
+            # Último parágrafo: última linha usa altura baseada no ascent (sem descent)
+            total += (n - 1) * line_h + visual_last_line_h
+
+    return total
+
+
+def _compute_start_y(layer: TextLayerSchema, block_height: int) -> int:
+    """
+    Calcula o y inicial do bloco considerando vertical_align e max_height.
+    Se max_height nao definido ou vertical_align=top, retorna layer.y sem alteracao.
+    """
+    if not layer.max_height or layer.vertical_align == VerticalAlign.top:
+        return layer.y
+    slack = layer.max_height - block_height
+    if slack <= 0:
+        return layer.y  # bloco maior que a caixa: sem ajuste
+    if layer.vertical_align == VerticalAlign.center:
+        return layer.y + slack // 2
+    # bottom
+    return layer.y + slack
+
+
 def _apply_text_layer(
     canvas:      Image.Image,
     layer:       TextLayerSchema,
@@ -565,11 +620,13 @@ def _apply_text_layer(
     for key in used_keys:
         symbol_images[key] = _load_symbol_image(symbols_map[key], ascent)
 
+    # Centralização vertical: mede o bloco e ajusta o y inicial
+    block_h   = _measure_text_block(paragraphs, font, symbol_images, layer, line_h)
+    current_y = _compute_start_y(layer, block_h)
+
     overlay    = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
     draw       = ImageDraw.Draw(overlay)
     color_rgba = _hex_to_rgba(layer.color, layer.opacity)
-
-    current_y   = layer.y
     total_lines = 0
 
     for p_idx, paragraph in enumerate(paragraphs):
@@ -578,7 +635,6 @@ def _apply_text_layer(
         lines  = _build_lines(units, layer.max_width)
 
         if not lines:
-            # Parágrafo vazio (\n consecutivos): avança uma linha em branco
             current_y += line_h
         else:
             for line in lines:
@@ -586,14 +642,14 @@ def _apply_text_layer(
                 current_y += line_h
             total_lines += len(lines)
 
-        # Espaçamento extra entre parágrafos (não após o último)
         if p_idx < len(paragraphs) - 1:
             current_y += layer.paragraph_spacing
 
     canvas.alpha_composite(overlay)
     logger.debug(
-        "text layer order=%d paragraphs=%d lines=%d pos=(%d,%d)",
-        layer.order, len(paragraphs), total_lines, layer.x, layer.y,
+        "text layer order=%d paragraphs=%d lines=%d block_h=%dpx start_y=%d",
+        layer.order, len(paragraphs), total_lines, block_h,
+        _compute_start_y(layer, block_h),
     )
 
 

@@ -446,6 +446,8 @@ Todas as camadas têm `order` (inteiro, define a ordem de composição, menor = 
   "tab_size": 4,
   "word_spacing": 8,
   "symbol_spacing": 12,
+  "max_height": 800,
+  "vertical_align": "center",
   "text_align": "left",
   "opacity": 1.0
 }
@@ -464,6 +466,8 @@ Todas as camadas têm `order` (inteiro, define a ordem de composição, menor = 
 | `tab_size` | int | `4` | Quantidade de espaços equivalentes por `\t` |
 | `word_spacing` | int | `0` | Pixels extras entre palavras. Negativo aproxima, positivo afasta |
 | `symbol_spacing` | int | `0` | Pixels de margem em cada lado de um símbolo inline |
+| `max_height` | int | `null` | Altura máxima da caixa de texto em px. Usado com `vertical_align` |
+| `vertical_align` | `"top"` \| `"center"` \| `"bottom"` | `"top"` | Alinhamento vertical do bloco dentro de `max_height` |
 | `text_align` | `"left"` \| `"center"` \| `"right"` | `"left"` | Alinhamento horizontal (requer `max_width`) |
 | `opacity` | float 0–1 | `1.0` | Opacidade do texto e dos símbolos inline |
 
